@@ -1,0 +1,82 @@
+# The @argszero/dsh-approval-bridge bundle patch: mount and go.
+#
+# An approval request is dispatched as a scope-filtered waterfall, and two
+# properties of that one dispatch line decide whether a plugin's listener is ever
+# reached. Neither of them logs anything when it is not:
+#
+#   packages/interaction/user-approval/src/index.ts
+#     return this.ctx.waterfall(scopeTarget(req.agent, req.agent), 'approval/request', req,
+#       () => Promise.resolve<ApprovalOutcome>('unavailable'))
+#
+# 1. **The dispatch is filtered by scope.** A listener registered on a context
+#    that carries a scope tag is admitted only for that scope's own agent and for
+#    that agent's ancestors — never a descendant, never a sibling. Every other
+#    agent's request is filtered out with no log line. `@deepseek-ai/dsh-scope`
+#    states the direction outright: "A tag BELOW the dispatch key stays excluded —
+#    events flow up the chain, never down." An untagged context is admitted for
+#    every dispatch.
+# 2. **Registration order decides first refusal.** The application's own forwarder
+#    to the browser is registered on the profile context
+#    (`packages/api/remotes/src/index.ts`, `forwardWaterfall`, subscribed with
+#    `{ event: 'approval/request', mode: 'waterfall' }`). A listener registered
+#    *after* it — the normal case for a plugin mounted later — is never called,
+#    because the forwarder already returned an outcome.
+#
+# So a third-party surface (a phone, an IM bot, a watch, a voice channel) cannot be
+# reached at all. That is the defect. The seam that closes it is one listener on an
+# **untagged** context registered with `{ prepend: true }`:
+#
+#   scopeOf(ctx) === undefined   ⇒ admitted for every dispatch (property 1), and
+#   { prepend: true }            ⇒ entered before the application's own forwarder
+#                                  (property 2, `vendor/cordis` registry ordering).
+#
+# Both were measured against the published line rather than read off the source. A
+# probe that registers exactly that listener observes a real approval request the
+# host chain leaves unanswered (`fired=1 outcome=unavailable`); the same listener
+# registered without `prepend` is entered *after* the forwarder (order
+# `['bridge', 'forwarder']`); a listener on a sibling agent's scope is admitted for
+# its own scope only; and `isScopeCarrier(ctx)` is true even where `scopeOf(ctx)` is
+# undefined, which is why the untagged test is on `scopeOf` and not on the carrier.
+#
+# What this plugin does with that one listener is turn it into a registry. A
+# deployment's own surface plugin injects `ctx.approvalBridge` and calls
+# `register({ name, match?, answer })`; the bridge arbitrates every registered
+# answerer against the host chain — the first *claiming* outcome wins, abstentions
+# are left to the others, and a throwing answerer is contained as an abstention so
+# that no answerer's bug can fail an approval **open**.
+#
+#   race  (default) — `next()` is started immediately, so a request reaches the
+#                     harness's own surface at exactly the moment it would have
+#                     without this plugin; whichever participant claims first wins.
+#   defer           — the answerers are asked first and `next()` is called only when
+#                     every one of them abstains. No host card is ever drawn for a
+#                     request the bridge answers, at the price of the answerer's own
+#                     latency on the abstention path — still bounded by the request's
+#                     own signal, never by a clock this plugin invented.
+#
+# `mode: 'bridge'` (the default) arbitrates. `observe` takes no decision at all and
+# counts only — it is the posture that answers "is my listener even reached?", the
+# question a plugin author cannot get answered anywhere else. `off` installs no
+# listener and still registers the report tool, because a posture whose whole
+# purpose is to report what it is not doing is the one that most needs a way to be
+# read.
+#
+# The report tool (`approval_bridge_report`) prints the dispatch counter and the
+# scope posture together. The counter is the denominator that separates "my
+# listener is not admitted" from "no approval was ever requested" — and nothing
+# else in the system produces it.
+#
+# Whether a session may be approved at all is not this plugin's to decide: the
+# approval service resolves its own `'never'` policy **before** dispatching
+# (`effectivePolicy(session) === 'never'` returns `'rejected'` without entering the
+# waterfall), so a `never` session never reaches this listener, in any mode.
+#
+# The value import — `defineTool` from @deepseek-ai/dsh-tools — is declared as a
+# peer rather than a dependency on purpose: a `dependencies` entry is how a plugin
+# ends up in a `profile` deployment with its own copy of the registry's package, a
+# second evaluation whose symbols are equal to nothing the host holds, a failure
+# this repository has already shipped more than once.
+
+- insert:
+    - id: approval-bridge
+      name: '@argszero/dsh-approval-bridge'
